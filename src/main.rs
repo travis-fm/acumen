@@ -1,10 +1,13 @@
 use glob::glob;
 use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout};
+use tokio::sync::Mutex;
+use tokio::task::{self, spawn_blocking, JoinHandle};
 use std::fs::read_to_string;
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+use std::sync::{Arc};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
@@ -17,6 +20,8 @@ use ratatui::{
     DefaultTerminal,
     Frame
 };
+
+use tokio::fs::read_to_string as read_to_string_async;
 
 #[derive(PartialEq, Debug)]
 enum SensorType {
@@ -103,19 +108,19 @@ impl Widget for &Sensor {
 }
 
 impl HwMon {
-    fn new(hwmon_path: PathBuf) -> io::Result<Self> {
+    async fn new(hwmon_path: PathBuf) -> io::Result<Self> {
         let hwmon = HwMon {
-            display_name: read_to_string(hwmon_path.join("name"))?
+            display_name: read_to_string_async(hwmon_path.join("name")).await?
                 .trim_ascii()
                 .to_string(),
-            sensors: HwMon::init_sensors(&hwmon_path)?,
+            sensors: HwMon::init_sensors(&hwmon_path).await?,
             hwmon_path,
         };
 
         Ok(hwmon)
     }
 
-    fn init_sensors(hwmon_path: &Path) -> io::Result<Vec<Sensor>> {
+    async fn init_sensors(hwmon_path: &Path) -> io::Result<Vec<Sensor>> {
         let mut sensors: Vec<Sensor> = vec![];
 
         let string_parse_err = io::Error::other(format!(
@@ -182,16 +187,17 @@ impl Widget for &HwMon {
 #[derive(Debug)]
 struct App {
     exit: bool,
-    modules: Vec<HwMon>,
+    modules: Vec<Arc<Mutex<HwMon>>>,
+    // modules: Vec<HwMon>,
     sensor_refresh_interval: Duration,
     app_frame_rate: Duration,
     last_sensor_refresh: Instant,
 }
 
 impl App {
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+    async fn run(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         while !self.exit {
-            self.update_modules();
+            self.update_modules().await;
             terminal.draw(|f| self.draw(f))?;
             self.handle_events()?;
         }
@@ -199,10 +205,20 @@ impl App {
         Ok(())
     }
 
-    fn update_modules(&mut self) {
+    async fn update_modules(&mut self) {
         if Instant::now() >= self.last_sensor_refresh + self.sensor_refresh_interval {
-            for module in &mut self.modules {
-                module.update_sensors();
+            let mut tasks = vec![];
+
+            for module in &self.modules {
+                let module = module.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    module.lock().await.update_sensors()
+                }));
+            }
+
+            for task in tasks {
+                task.await;
             }
 
             self.last_sensor_refresh = Instant::now();
@@ -248,15 +264,13 @@ impl Widget for &App {
             .title_bottom(app_version.right_aligned())
             .border_set(border::THICK);
 
-        /*
-        let header_footer_size = 16;
-        let main_area_size = app_block.inner(area).height - (header_footer_size * 2);
-        let [header_area, main_area, footer_area] = Layout::vertical([
-            Constraint::Max(header_footer_size),
-            Constraint::Length(main_area_size),
-            Constraint::Max(header_footer_size),
-        ]).areas(app_block.inner(area));
-        */
+        // let header_footer_size = 16;
+        // let main_area_size = app_block.inner(area).height - (header_footer_size * 2);
+        // let [header_area, main_area, footer_area] = Layout::vertical([
+        //     Constraint::Max(header_footer_size),
+        //     Constraint::Length(main_area_size),
+        //     Constraint::Max(header_footer_size),
+        // ]).areas(app_block.inner(area));
         let [main_area] = Layout::vertical([
             Constraint::Fill(1)
         ]).areas(app_block.inner(area));
@@ -267,14 +281,15 @@ impl Widget for &App {
         let module_layout = Layout::horizontal(module_cols).spacing(1).split(main_area);
 
         app_block.render(area, buf);
-
+        
         for i in 0..self.modules.len() {
-            self.modules[i].render(module_layout[i], buf);
+            self.modules[i].blocking_lock().render(module_layout[i], buf);
         }
     }
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let mut app = App {
         exit: false,
         modules: vec![],
@@ -285,30 +300,25 @@ fn main() -> io::Result<()> {
     
     match glob("/sys/class/hwmon/hwmon*") {
         Ok(paths) => {
+            let mut tasks = vec![];
+
             for path in paths.flatten() {
-                if let Ok(module) = HwMon::new(path) {
-                    app.modules.push(module);
-                }
+                tasks.push(tokio::spawn(async move {
+                    HwMon::new(path.clone()).await
+                }));
+            }
+
+            for task in tasks {
+                app.modules.push(Arc::new(Mutex::new(task.await??)));
             }
         }
         Err(..) => {
             println!("Unable to read glob pattern");
         }
     }
-
+    
     let mut terminal = ratatui::init();
-    let app_result = app.run(&mut terminal);
+    let app_result = app.run(&mut terminal).await;
     ratatui::restore();
     app_result
-
-    /*
-    loop {
-        for module in &mut modules {
-            module.update_sensors();
-            println!("{:#?}", module);
-        }
-
-        sleep(Duration::from_secs(5));
-    }
-    */
 }
